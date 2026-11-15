@@ -1,0 +1,16 @@
+# Start (and keep running, also after reboots):   docker compose up -d --build
+# Web page:                                        http://<server-ip>:8080   (APP_USER / APP_PASSWORD from .env)
+# Logs:                                            docker compose logs -f
+# One-off run without the web page:                docker compose run --rm splitter "https://www.youtube.com/watch?v=..."
+services:
+  splitter:
+    build: .
+    command: ["--serve"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data   # youtube_token.json and cookies.txt go here; clips/progress are saved here too

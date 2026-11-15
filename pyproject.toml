@@ -1,0 +1,21 @@
+[project]
+name = "splitter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { email = "adarshmilan92@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "google-api-python-client>=2.202.0",
+    "google-auth-oauthlib>=1.5.0",
+    "yt-dlp>=2026.10.26",
+]
+
+[project.scripts]
+splitter = "splitter:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"

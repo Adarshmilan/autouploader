@@ -1,0 +1,11 @@
+.venv
+.env
+data
+output
+client_secret*.json
+youtube_token.json
+youtube_quota.json
+cookies*.txt
+src/splitter/downloadedVideos
+src/splitter/downloadedTranscripts
+**/__pycache__
