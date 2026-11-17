@@ -30,6 +30,15 @@ def _api(method, path, params=None, data=None, headers=None, base=None):
         raise InstagramError(f"HTTP {e.code}: {e.read().decode()}") from e
 
 
+def publishing_limit():
+    """How many posts Instagram still allows in the rolling 24 h window: {"used", "total"}."""
+    data = _api("GET", f"{config.INSTAGRAM_USER_ID}/content_publishing_limit", params={
+        "fields": "config,quota_usage", "access_token": config.INSTAGRAM_ACCESS_TOKEN,
+    }).get("data") or [{}]
+    entry = data[0]
+    return {"used": int(entry.get("quota_usage", 0)), "total": int((entry.get("config") or {}).get("quota_total", 50))}
+
+
 def upload_reel(path, caption):
     """Post one clip as a Reel. Returns {"id", "url"}."""
     token, user_id = config.INSTAGRAM_ACCESS_TOKEN, config.INSTAGRAM_USER_ID

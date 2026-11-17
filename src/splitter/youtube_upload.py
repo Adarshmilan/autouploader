@@ -2,7 +2,7 @@
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.auth.exceptions import RefreshError
@@ -47,6 +47,13 @@ def _save_quota(data):
 
 def uploads_left_today():
     return max(0, config.YOUTUBE_DAILY_LIMIT - _load_quota()["uploads"])
+
+
+def seconds_until_reset():
+    """Seconds until the daily cap resets (midnight Pacific time)."""
+    now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((midnight - now).total_seconds())
 
 
 def _count_upload():

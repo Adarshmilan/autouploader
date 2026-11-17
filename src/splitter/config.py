@@ -70,6 +70,10 @@ PENDING_EVERY_HOURS = float(get("PENDING_EVERY_HOURS", "3"))  # how often waitin
 
 # Delete a clip's .mp4 once it's posted on every configured platform (saves server disk).
 DELETE_AFTER_UPLOAD = get("DELETE_AFTER_UPLOAD", "true").lower() == "true"
+# Only the newest N videos keep their clip files on disk; older ones are deleted automatically.
+KEEP_VIDEOS = max(1, int(get("KEEP_VIDEOS", "3")))
+# Biggest video you can drop on the web page.
+MAX_UPLOAD_MB = int(get("MAX_UPLOAD_MB", "1024"))
 
 # --- YouTube downloading from a cloud server ---
 # YouTube often blocks datacenter IPs ("Sign in to confirm you're not a bot").
