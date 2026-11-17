@@ -48,6 +48,7 @@ from splitter.main import (
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 INCOMING_DIR = os.path.join(config.OUTPUT_DIR, "_incoming")  # dropped files land here first
 PLATFORMS = ("youtube", "instagram")
+PLATFORM_NAMES = {"youtube": "YouTube", "instagram": "Instagram"}
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".3gp")
 MAX_JOBS_SHOWN = 15
 HISTORY_SHOWN = 25
@@ -469,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
         count = approve(video_dir, picks, platforms)
         if not count:
             raise ValueError("those clips no longer exist")
-        job = add_job("post", f"Posting {count} clip{'s' * (count != 1)} to {' + '.join(platforms)}",
+        job = add_job("post", f"Posting {count} clip{'s' * (count != 1)} to {' + '.join(PLATFORM_NAMES[p] for p in platforms)}",
                       post_job(video_dir), os.path.basename(video_dir))
         return self._json(202, {"id": job["id"], "count": count})
 
