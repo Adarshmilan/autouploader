@@ -15,6 +15,8 @@ import glob
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 
 from splitter import config
@@ -36,13 +38,40 @@ def load_state(video_dir):
 
 
 def save_state(video_dir, state):
-    with open(os.path.join(video_dir, "uploads.json"), "w", encoding="utf-8") as f:
+    """Write to a temp file first, then swap it in: the web page never reads a half-written file."""
+    path = os.path.join(video_dir, "uploads.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: someone is reading it right now
+            time.sleep(0.05 * (attempt + 1))
+    os.replace(tmp, path)
+
+
+# approve/discard (web requests) and cleanup (worker) must not edit the same uploads.json at once
+state_lock = threading.RLock()
+
+
+# Per-platform status of a clip:
+#   review  -> made by the web page, waiting for you to press "Post" (never uploaded automatically)
+#   pending -> approved, will be uploaded (now, or later when YouTube's daily cap resets)
+#   error   -> failed, retried up to MAX_ATTEMPTS times
+#   done    -> posted
+#   skipped -> you didn't pick this clip / platform
+UPLOADABLE = ("pending", "error")
 
 
 def needs_upload(clip, platform):
     entry = clip[platform]
-    return entry["status"] != "done" and entry.get("attempts", 0) < MAX_ATTEMPTS
+    return entry["status"] in UPLOADABLE and entry.get("attempts", 0) < MAX_ATTEMPTS
+
+
+def in_review(state):
+    return any(c[p]["status"] == "review" for c in state["clips"] for p in ("youtube", "instagram"))
 
 
 # ---------- uploading ----------
@@ -131,6 +160,8 @@ def delete_if_finished(clip, video_dir):
     """Free disk space: remove the .mp4 once every configured platform is done (or gave up)."""
     if not config.DELETE_AFTER_UPLOAD:
         return
+    if any(clip[p]["status"] == "review" for p in ("youtube", "instagram")):
+        return  # still waiting for you to look at it
     platforms = [p for p, ok in (("youtube", config.youtube_configured()),
                                  ("instagram", config.instagram_configured())) if ok]
     if platforms and not any(needs_upload(clip, p) for p in platforms):
@@ -146,7 +177,10 @@ def upload_pending(uploader, skip_dir=None):
     for path in dirs:
         video_dir = os.path.dirname(path)
         state = load_state(video_dir)
-        if video_dir != skip_dir and any(needs_upload(c, p) for c in state["clips"] for p in ("youtube", "instagram")):
+        if video_dir != skip_dir and any(
+            needs_upload(c, p) and os.path.exists(os.path.join(video_dir, c["file"]))
+            for c in state["clips"] for p in ("youtube", "instagram")
+        ):
             waiting.append(video_dir)
 
     if waiting:
@@ -157,7 +191,9 @@ def upload_pending(uploader, skip_dir=None):
 
 # ---------- the pipeline for one link ----------
 
-def process(url, uploader):
+def process(url, uploader, review=False):
+    """Link -> clips. With review=True (web page) it stops when the clips are made and waits
+    for you to press "Post"; otherwise (command line) it uploads straight away."""
     print("\n[1/5] Getting video info...")
     info = get_video_info(url)
     video_dir = os.path.join(config.OUTPUT_DIR, info["id"])
@@ -165,6 +201,14 @@ def process(url, uploader):
     print(f"   {info['title']}  ({fmt(info['duration'])})")
 
     state = load_state(video_dir)
+    if state and review and not any(
+        os.path.exists(os.path.join(video_dir, c["file"])) for c in state["clips"]
+    ) and not any(c[p]["status"] == "done" for c in state["clips"] for p in ("youtube", "instagram")):
+        # Same link again, but its clips were cleaned up and nothing was posted: make them again
+        # (transcript + AI moments are reused, only the cutting is redone).
+        os.remove(os.path.join(video_dir, "uploads.json"))
+        state = None
+
     if not state:
         print("[2/5] Downloading transcript...")
         transcript = get_transcript(info["url"], video_dir)
@@ -191,25 +235,191 @@ def process(url, uploader):
         print("[4/5] Downloading only those parts and making vertical clips...")
         paths = make_clips(info["url"], moments, video_dir, info["duration"])
 
+        first = "review" if review else "pending"
         state = {
-            "video": info,
+            "video": {**info, "source": "youtube"},
+            "created": time.time(),
             "clips": [
                 {
                     "file": os.path.basename(p),
                     **{k: m[k] for k in ("start", "end", "title", "caption", "hashtags")},
-                    "youtube": {"status": "pending"},
-                    "instagram": {"status": "pending"},
+                    "youtube": {"status": first},
+                    "instagram": {"status": first},
                 }
                 for p, m in zip(paths, moments)
             ],
         }
         save_state(video_dir, state)
+        cleanup_old_videos()
+    elif review:
+        state["created"] = time.time()  # used again: counts as the newest video
+        save_state(video_dir, state)
+        print("   Already processed before.")
     else:
         print("   Already processed before — only uploading what's still pending.")
+
+    if review:
+        print("[5/5] Clips ready — review them and press Post.")
+        return video_dir
 
     print("[5/5] Uploading...")
     uploader.upload_video_dir(video_dir)
     return video_dir
+
+
+# ---------- your own video (web page drag & drop) ----------
+
+def process_file(src_path, original_name, title, caption, hashtags, platforms, vertical, uploader):
+    """A video you dropped on the page: no transcript/AI/cutting, just (if needed) convert, then upload."""
+    from splitter.clips import prepare_upload
+
+    video_id = f"upload-{time.strftime('%Y%m%d-%H%M%S')}"
+    video_dir = os.path.join(config.OUTPUT_DIR, video_id)
+    os.makedirs(video_dir, exist_ok=True)
+
+    print(f"\n[1/2] Preparing {original_name}...")
+    clip = os.path.join(video_dir, "clip_01.mp4")
+    try:
+        prepare_upload(src_path, clip, vertical)
+    except BaseException:
+        import shutil
+        shutil.rmtree(video_dir, ignore_errors=True)
+        raise
+    duration = media_duration(clip)
+
+    title = title.strip() or os.path.splitext(original_name)[0][:100] or "My video"
+    state = {
+        "video": {"id": video_id, "title": title, "duration": duration, "url": None,
+                  "source": "upload", "filename": original_name},
+        "created": time.time(),
+        "clips": [{
+            "file": "clip_01.mp4", "start": 0, "end": duration,
+            "title": title, "caption": caption.strip(), "hashtags": clean_hashtags(hashtags),
+            **{p: {"status": "pending" if p in platforms else "skipped"} for p in ("youtube", "instagram")},
+        }],
+    }
+    save_state(video_dir, state)
+    cleanup_old_videos()
+
+    print("[2/2] Uploading...")
+    uploader.upload_video_dir(video_dir)
+    return video_dir
+
+
+def media_duration(path):
+    import subprocess
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    try:
+        return round(float(result.stdout.strip()), 1)
+    except ValueError:
+        return 0
+
+
+def clean_hashtags(value):
+    words = value.split() if isinstance(value, str) else list(value or [])
+    tags = []
+    for w in words:
+        w = w.strip().strip(",")
+        if w and w != "#":
+            tags.append(w if w.startswith("#") else f"#{w}")
+    return tags[:15]
+
+
+# ---------- review: post / discard ----------
+
+def approve(video_dir, picks, platforms):
+    """You pressed Post. picks: [{file, title, caption, hashtags}] = the clips to post (with your edits).
+    Clips not in picks are skipped and deleted. Returns how many clips will be uploaded."""
+    with state_lock:
+        state = load_state(video_dir)
+        if not state or not in_review(state):
+            raise ValueError("these clips were already posted or discarded")
+        edits = {p["file"]: p for p in picks}
+        count = 0
+        for clip in state["clips"]:
+            pick = edits.get(clip["file"])
+            if pick and os.path.exists(os.path.join(video_dir, clip["file"])):
+                if pick.get("title", "").strip():
+                    clip["title"] = pick["title"].strip()[:100]
+                if "caption" in pick:
+                    clip["caption"] = pick["caption"].strip()[:2000]
+                if "hashtags" in pick:
+                    clip["hashtags"] = clean_hashtags(pick["hashtags"])
+                for p in ("youtube", "instagram"):
+                    clip[p] = {"status": "pending" if p in platforms else "skipped"}
+                count += 1
+            else:
+                for p in ("youtube", "instagram"):
+                    clip[p] = {"status": "skipped"}
+                _remove_file(os.path.join(video_dir, clip["file"]))
+        save_state(video_dir, state)
+        return count
+
+
+def discard(video_dir):
+    with state_lock:
+        state = load_state(video_dir)
+        if not state or not in_review(state):
+            raise ValueError("these clips were already posted or discarded")
+        for clip in state["clips"]:
+            for p in ("youtube", "instagram"):
+                if clip[p]["status"] == "review":
+                    clip[p] = {"status": "skipped"}
+            _remove_file(os.path.join(video_dir, clip["file"]))
+        save_state(video_dir, state)
+
+
+def _remove_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+# ---------- disk space: keep only the newest few videos ----------
+
+def video_dirs():
+    """All processed videos, newest first: [(video_dir, state)]."""
+    found = []
+    for path in glob.glob(os.path.join(config.OUTPUT_DIR, "*", "uploads.json")):
+        video_dir = os.path.dirname(path)
+        try:
+            state = load_state(video_dir)
+        except (OSError, ValueError):
+            continue
+        if state:
+            state.setdefault("created", os.path.getctime(path))
+            found.append((video_dir, state))
+    found.sort(key=lambda d: d[1]["created"], reverse=True)
+    return found
+
+
+def cleanup_old_videos(keep=None):
+    """Only the newest `keep` videos (KEEP_VIDEOS, default 3) keep their files on disk.
+    Older ones lose their .mp4 clips and transcripts; uploads.json stays so their links stay listed."""
+    with state_lock:
+        keep = config.KEEP_VIDEOS if keep is None else keep
+        with_files = [
+            (d, s) for d, s in video_dirs()
+            if glob.glob(os.path.join(glob.escape(d), "*.mp4"))
+        ]
+        for video_dir, state in with_files[keep:]:
+            for pattern in ("*.mp4", "*.part", "*.json3", "*.vtt", "*.m4a", "*.webm"):
+                for f in glob.glob(os.path.join(glob.escape(video_dir), pattern)):
+                    _remove_file(f)
+            changed = False
+            for clip in state["clips"]:
+                for p in ("youtube", "instagram"):
+                    if clip[p]["status"] in ("review", "pending", "error"):
+                        clip[p] = {**clip[p], "status": "skipped", "error": "deleted to free space (only the newest "
+                                                                           f"{keep} videos are kept)"}
+                        changed = True
+            if changed:
+                save_state(video_dir, state)
+            print(f"   cleaned up old video: {state['video'].get('title') or os.path.basename(video_dir)}")
 
 
 def summary():
@@ -227,6 +437,13 @@ def summary():
 
 
 def main():
+    # Windows consoles default to cp1252: printing ✓ or a video title with emoji would crash
+    # right after a successful upload (and the clip would be posted twice). Never let that happen.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = sys.argv[1:]
     only_pending = "--pending" in args
 

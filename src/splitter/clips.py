@@ -104,6 +104,64 @@ def make_vertical(src, dst):
     raise RuntimeError("FFmpeg couldn't encode H.264 with any encoder:\n" + "\n".join(errors))
 
 
+def _codecs(path):
+    """{"video": "h264", "audio": "aac"} (missing kinds are left out)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    found = {}
+    for line in result.stdout.split():
+        name, _, kind = line.partition(",")
+        found.setdefault(kind, name)
+    return found
+
+
+def make_compatible(src, dst):
+    """Keep the picture as it is, only re-encode to H.264 + AAC MP4 (what Instagram and YouTube accept)."""
+    global _working_encoder
+    errors = []
+    for encoder in [_working_encoder] if _working_encoder else ENCODERS:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", src,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", "scale=trunc(min(iw\\,1920)/2)*2:-2,format=yuv420p",
+            *encoder, "-r", "30",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-movflags", "+faststart", dst,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            _working_encoder = encoder
+            return
+        errors.append(f"{encoder[1]}: {result.stderr.strip()[-400:]}")
+    raise RuntimeError("FFmpeg couldn't convert the video:\n" + "\n".join(errors))
+
+
+def prepare_upload(src, dst, vertical=False):
+    """Your own video -> an uploadable .mp4 at dst. Already-fine MP4s are just moved (no quality loss)."""
+    tmp = dst + ".tmp.mp4"
+    try:
+        codecs = _codecs(src)
+        if "video" not in codecs:
+            raise RuntimeError("that file has no video track (or isn't a video)")
+        if vertical:
+            print("   making it vertical 1080x1920...")
+            make_vertical(src, tmp)
+        elif (codecs.get("video") == "h264" and codecs.get("audio") in ("aac", None)
+              and src.lower().endswith((".mp4", ".m4v"))):
+            os.replace(src, dst)
+            return
+        else:
+            print(f"   converting {codecs.get('video')}/{codecs.get('audio', 'no audio')} to H.264/AAC...")
+            make_compatible(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        for leftover in (tmp, src):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+
 def make_clips(url, moments, out_dir, video_duration=0):
     """Create clip_01.mp4, clip_02.mp4, ... in out_dir. Clips that already exist are reused."""
     paths = []
