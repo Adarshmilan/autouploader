@@ -1,6 +1,7 @@
 # ===== Secrets — never commit these =====
 .env
 .env.*
+!.env.example
 client_secret*.json
 youtube_token.json
 cookies*.txt
@@ -29,6 +30,3 @@ wheels/
 .vscode/
 .idea/
 .DS_Store
-youtube_token.json
-client_secret.json
-.env
